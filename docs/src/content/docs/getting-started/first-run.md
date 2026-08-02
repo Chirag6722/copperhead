@@ -9,16 +9,81 @@ The [Quickstart](/getting-started/quickstart/) lists the commands. This page wal
 
 Budget about twenty minutes. At the end you will have one small, ERC-verified, committed change, and enough of a feel for the loop to decide whether you trust it with a bigger one.
 
+:::note[Shell syntax on this page]
+Commands are written for bash (macOS, Linux, Git Bash). On **Windows `cmd`**, swap `export FOO=bar` for `set "FOO=bar"`, and use `\` in paths. Both variants are given wherever it actually matters.
+:::
+
+## Install
+
+Four things. copperhead checks three of them for you in Step 1, so install first and let it grade your work.
+
+### 1. Node.js 20 or newer
+
+```bash
+node --version
+```
+
+Nothing, or a number below 20? Install it from [nodejs.org](https://nodejs.org/).
+
+### 2. KiCad 8 or newer
+
+Install the desktop app; copperhead drives the `kicad-cli` tool that ships inside it. The [download page](https://www.kicad.org/download/) asks you to pick a platform and then a mirror — any mirror works, so take the one nearest you.
+
+:::caution[KiCad does not put itself on your PATH]
+This is the single most common setup failure, and the error you get (`kicad-cli not found on PATH`) does not say that KiCad is installed fine and merely invisible. It usually is.
+
+**Windows** — the installer does not touch PATH at all. Run this once in PowerShell, adjusting `10.0` to your version:
+
+```powershell
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path","User") + ";C:\Program Files\KiCad\10.0\bin", "User")
+```
+
+**macOS** — the binary lives inside the app bundle:
+
+```bash
+export PATH="/Applications/KiCad/KiCad.app/Contents/MacOS:$PATH"
+```
+
+Then **open a new terminal.** A PATH change never reaches a window that was already open, so re-running `doctor` in the same one will fail again and send you chasing a problem you have already fixed.
+
+Not sure where it landed? Find it:
+
+```powershell
+Get-ChildItem "C:\Program Files\KiCad" -Filter kicad-cli.exe -Recurse | Select FullName
+```
+:::
+
+### 3. git
+
+```bash
+git --version
+```
+
+### 4. copperhead
+
+```bash
+npm install -g copperhead
+copperhead --version
+```
+
+Already inside an AI coding assistant? Paste this instead and it will do the whole setup for you:
+
+```text
+Install copperhead for this repo using https://raw.githubusercontent.com/chouhanindustries/copperhead/main/agent-install-prompt.md
+```
+
 ## Before you start
 
 You need a KiCad project in a git repository. Not a copy on the desktop — an actual repo, because copperhead snapshots with git before it edits and rolls back to that snapshot when verification fails. No repo, no safety net, and the preflight will refuse to run.
 
-If your board is not in git yet:
+**Everything must be committed before you run.** copperhead refuses to start on a tree with uncommitted changes, because its snapshot-and-rollback contract cannot tell your unsaved work from its own. A fresh `git init` alone is not enough — the first commit has to exist too.
 
 ```bash
 cd my-board
 git init && git add -A && git commit -m "baseline before copperhead"
 ```
+
+Working on something you cannot commit yet? Pass `--allow-dirty`, which snapshots through `git stash create` instead.
 
 Work on a branch for the first run. Nothing here is destructive, but a branch makes "throw it all away" a one-liner:
 
@@ -50,13 +115,7 @@ not ready: fix the [FAIL] items above
 
 `[info]` lines are notes, not problems — the missing `config.json` on that last line is exactly what Step 3 creates. Only `[FAIL]` blocks you. Exit code is 0 when ready, 1 when not, so this is safe to put in a setup script.
 
-:::caution[kicad-cli must be on PATH]
-Every copperhead command probes `kicad-cli` before doing anything, so if this check fails, nothing else will run. On macOS the binary ships inside the app bundle and is often not linked:
-
-```bash
-export PATH="/Applications/KiCad/KiCad.app/Contents/MacOS:$PATH"
-```
-:::
+If `kicad-cli` fails here, go back to the PATH note in Install — and remember that the fix only takes effect in a new terminal.
 
 ## Step 2: Choose one model backend
 
@@ -68,11 +127,49 @@ If you already use Codex CLI or Claude Code, reuse that login and skip API keys 
 export COPPERHEAD_MODEL=codex          # or: claude-code, cursor
 ```
 
-Otherwise export a single key:
+For Claude Code you also need its token. Generate one:
+
+```bash
+claude setup-token
+```
+
+Then set it, together with the model:
+
+```bash
+export CLAUDE_CODE_OAUTH_TOKEN="<the token it printed>"
+export COPPERHEAD_MODEL=claude-code
+```
+
+On Windows `cmd`, the same two:
+
+```text
+set "CLAUDE_CODE_OAUTH_TOKEN=<the token it printed>"
+set "COPPERHEAD_MODEL=claude-code"
+```
+
+Otherwise export a single API key:
 
 ```bash
 export ANTHROPIC_API_KEY=...           # or OPENAI_API_KEY, not both
 ```
+
+:::caution[Two ways a perfectly good token still fails]
+**A line break became a space.** Long tokens wrap when copied out of a terminal, and the wrap can paste back as a space in the middle. The result is a 401 that reads as though the credential were revoked:
+
+```text
+run failed: provider error: Failed to authenticate. API Error: 401 OAuth access token is invalid.
+```
+
+Check the length rather than eyeballing it — a real token is roughly 100+ characters with no spaces:
+
+```powershell
+$env:CLAUDE_CODE_OAUTH_TOKEN.Length
+```
+
+The quotes in `set "VAR=value"` and `export VAR="value"` above are what keep a stray space from truncating the value.
+
+**It only lived in one window.** `set` and `export` last for that terminal session only. Open a new window and the credential is gone, and `doctor` reports no model configured again. Use `setx` on Windows, or your shell profile on macOS and Linux, to make it stick.
+:::
 
 :::danger[Two keys in your environment is a hard stop]
 If you have both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` exported — common on a developer machine — copperhead refuses to guess:
@@ -175,13 +272,31 @@ Worth calibrating before you reach for the big commands:
 
 `create` is a full pipeline — spec, architecture, part selection, schematic, layout, outputs, firmware, dev plan. Individual stages can legitimately run over an hour. It is not hung; it prints a heartbeat every 30 seconds while a turn is in flight. Try it first on a small brief from [examples/simple](https://github.com/chouhanindustries/copperhead/tree/main/examples/simple).
 
+### Starting a new board instead
+
+This page assumes a board you already have. From nothing, the shape is the same but the command is `create`:
+
+```bash
+mkdir my-board && cd my-board
+git init
+cp path/to/examples/simple/coin-cell-led-beacon.md brief.md
+git add -A && git commit -m "brief"
+copperhead create --brief brief.md
+```
+
+Start from an example brief rather than your own. You are testing whether the pipeline runs on your machine, and a known-good input keeps a bad first result from being ambiguous. Each stage commits on its own, so an interrupted run resumes from the last finished one — re-running the same command picks up where it stopped.
+
 ## When it goes wrong
 
 | What you see | What it means | Fix |
 |---|---|---|
-| `kicad-cli` check fails in `doctor` | KiCad's CLI is not on `PATH`; nothing will run | Add KiCad's binary directory to `PATH` |
+| `kicad-cli not found on PATH` | KiCad is almost certainly installed, just invisible | Add its `bin` directory to `PATH`, then **open a new terminal** |
+| `kicad-cli` still missing after the PATH fix | The change never reached this window | Close the terminal and open a new one |
 | `ambiguous: 2 credentials found` | Two API keys exported, no model named | `export COPPERHEAD_MODEL=claude` |
 | `no model configured` | No key and no saved login found | Export one key, or set `COPPERHEAD_MODEL` to a saved-login backend |
+| `no model configured`, but you set one | `set` / `export` only covered the old window | Re-set it here, or persist it with `setx` / your shell profile |
+| `401 OAuth access token is invalid` | Usually a space pasted into the token, not a revoked one | Check its length, re-set it quoted and unbroken |
+| `Connection closed mid-response` | Transient network drop | Nothing: the pipeline diagnoses and retries the stage itself |
 | Preflight refuses on a dirty tree | Uncommitted changes would be caught in the snapshot | Commit or stash first, or pass `--allow-dirty` |
 | `ERC skipped (no schematic configured)` | `init` has not run, or config points nowhere | `copperhead init` |
 | `run failed: ... working tree restored` | Verification never passed; changes were rolled back | See the preserved-work note below |
