@@ -12,6 +12,32 @@ export interface CopperheadConfig {
   stageMaxTurns?: Record<string, number>;
   maxRepairCycles: number;
   budgets: Record<string, number>;
+  /** Per-turn watchdog (ms). A provider turn exceeding this is aborted and
+   * retried, so a hung call can't stall the run forever. <=0 disables it. */
+  turnTimeoutMs: number;
+  /** How often (ms) to emit a liveness heartbeat while a provider turn is in
+   * flight, so a slow large-output turn is distinguishable from a hung one
+   * (5.1). Fires only after the first interval, so quick turns stay silent.
+   * <=0 disables it. */
+  heartbeatMs: number;
+  /** How many times the create pipeline may auto-retry a stage that failed or
+   * ended without meeting its contract, gated by an LLM diagnosis each time. */
+  maxStageRetries: number;
+  /** Cache each turn's LLM response to disk and replay it on identical inputs,
+   * so retries/restarts reuse work already paid for. Default on. */
+  llmCache: boolean;
+  /**
+   * Base URL of an OpenAI-compatible endpoint (Groq, OpenRouter, Gemini's
+   * compat endpoint, a local Ollama). Consulted only by the `compat`
+   * route (design D2), so a stray value never redirects a plain `gpt-5` run.
+   */
+  baseURL?: string;
+  /**
+   * Name of the environment variable holding the compat endpoint's key, e.g.
+   * `GROQ_API_KEY`. The *name*, never the key itself: credentials stay in the
+   * environment (AC-4.1).
+   */
+  apiKeyEnv?: string;
   /** Content hashes of generated docs, for init idempotency (AC-1.4). */
   generatedHashes?: Record<string, string>;
   /**
@@ -30,6 +56,19 @@ export const DEFAULTS: Omit<CopperheadConfig, 'schematic' | 'board'> = {
   maxTurns: 40,
   maxRepairCycles: 5,
   budgets: {},
+  // 10 min. A single large capture turn (a full lib_symbols + instances edit,
+  // ~40k output tokens) on the claude-code provider legitimately runs several
+  // minutes; the old 5-min deadline killed those mid-flight and, because the
+  // watchdog budget is spent per stage, could fail a stage that was only slow,
+  // not hung. 10 min clears the largest observed turns while still catching a
+  // genuinely stuck subprocess.
+  turnTimeoutMs: 600000,
+  // 30s: within one interval an operator knows a turn is alive, and a full
+  // 10-min turn emits ~20 lines — enough to distinguish slow from hung without
+  // flooding the log. Quick turns (< 30s) emit nothing.
+  heartbeatMs: 30000,
+  maxStageRetries: 2,
+  llmCache: true,
 };
 
 export function configPath(repoRoot: string): string {
@@ -56,13 +95,22 @@ export async function loadConfig(repoRoot: string): Promise<CopperheadConfig> {
     ...(Object.keys(stageMaxTurns).length ? { stageMaxTurns } : {}),
     maxRepairCycles: raw.maxRepairCycles ?? DEFAULTS.maxRepairCycles,
     budgets: raw.budgets ?? {},
+    turnTimeoutMs: typeof raw.turnTimeoutMs === 'number' ? raw.turnTimeoutMs : DEFAULTS.turnTimeoutMs,
+    heartbeatMs: typeof raw.heartbeatMs === 'number' ? raw.heartbeatMs : DEFAULTS.heartbeatMs,
+    maxStageRetries:
+      Number.isInteger(raw.maxStageRetries) && (raw.maxStageRetries as number) >= 0
+        ? (raw.maxStageRetries as number)
+        : DEFAULTS.maxStageRetries,
+    llmCache: raw.llmCache !== false,
+    ...(typeof raw.baseURL === 'string' && raw.baseURL.trim() ? { baseURL: raw.baseURL.trim() } : {}),
+    ...(typeof raw.apiKeyEnv === 'string' && raw.apiKeyEnv.trim() ? { apiKeyEnv: raw.apiKeyEnv.trim() } : {}),
     ...(raw.generatedHashes ? { generatedHashes: raw.generatedHashes } : {}),
     ...(raw.origin === 'create' || raw.origin === 'init' ? { origin: raw.origin } : {}),
   };
 }
 
 /** Which level of the model-selection precedence chain won. */
-export type ModelSource = 'flag' | 'env' | 'config' | 'openai-key' | 'anthropic-key';
+export type ModelSource = 'flag' | 'env' | 'config' | 'openai-key' | 'anthropic-key' | 'picker';
 
 export interface ResolvedModel {
   model: string;
@@ -77,8 +125,14 @@ export interface ResolvedModel {
  * Accepted values (same set for `--model`, COPPERHEAD_MODEL, and `model` in
  * .copperhead/config.json):
  *
- * - `claude`  : the Anthropic provider on its default model.
- * - `claude-*`: any Anthropic model id, passed through verbatim, e.g.
+ * - `cursor`          : the Cursor Agent CLI using saved login (`agent login`).
+ * - `cursor:<id>`     : the same provider on a specific model id.
+ * - `claude-code`     : the Claude Code saved-login provider on its default
+ *                       model. Needs NO API key — it reuses the logged-in Claude
+ *                       Code CLI / CLAUDE_CODE_OAUTH_TOKEN via the Agent SDK.
+ * - `claude-code:<id>`: the same provider on a specific model id.
+ * - `claude`  : the Anthropic API provider on its default model.
+ * - `claude-*`: any Anthropic API model id, passed through verbatim, e.g.
  *               `claude-opus-4-5`. Anything starting with `claude` routes here.
  * - `codex`   : the locally installed Codex CLI using its saved ChatGPT login.
  * - `codex:*` : Codex CLI with an explicit model id, e.g. `codex:gpt-5.6`.
@@ -87,18 +141,89 @@ export interface ResolvedModel {
  *               `gpt-5-mini` or `o3`.
  *
  * Routing is prefix-based, not a fixed list (see makeProvider in agent/loop.ts),
- * so a model released after this build still works without a code change. The
- * cost is that a typo like `claud-sonnet-5` silently routes to OpenAI and fails
- * there. Anthropic and direct OpenAI providers require their API keys; `codex`
- * instead requires a locally installed and authenticated Codex CLI.
+ * matched top to bottom: `claude-code`/`claude-code:<id>` is checked BEFORE the
+ * `claude*` prefix, so it is never captured by the Anthropic API route. A model
+ * released after this build still works without a code change. The cost is that
+ * a typo like `claud-sonnet-5` silently routes to OpenAI and fails there.
+ * Anthropic and direct OpenAI providers require their API keys; `codex` requires
+ * a locally installed and authenticated Codex CLI, and `claude-code` requires a
+ * Claude Code login (CLAUDE_CODE_OAUTH_TOKEN); `cursor` requires `agent login`.
+ * None of the saved-login providers need a model API key.
  */
 export function resolveModel(flag: string | undefined, config: CopperheadConfig, env = process.env): ResolvedModel {
   if (flag) return { model: flag, source: 'flag' };
   if (env.COPPERHEAD_MODEL) return { model: env.COPPERHEAD_MODEL, source: 'env' };
   if (config.model) return { model: config.model, source: 'config' };
-  if (env.OPENAI_API_KEY) return { model: 'gpt-5', source: 'openai-key' };
-  if (env.ANTHROPIC_API_KEY) return { model: 'claude', source: 'anthropic-key' };
+  // Auto-fallback is only safe when exactly one credential is present: guessing
+  // is a convenience when there is nothing to guess wrong. With two or more
+  // keys set (a common dev setup once a compat endpoint's key sits alongside
+  // OPENAI_API_KEY/ANTHROPIC_API_KEY), silently favoring whichever is checked
+  // first can send a request to the wrong provider with no signal — including
+  // a paid one when a free key was what was actually intended. Refuse instead
+  // of guessing; the compat route itself is never a fallback candidate here,
+  // since it is opt-in only via an explicit `compat:` prefix (design D2).
+  const available: { keyVar: string; model: string; source: ModelSource }[] = [
+    ...(env.OPENAI_API_KEY ? [{ keyVar: 'OPENAI_API_KEY', model: 'gpt-5', source: 'openai-key' as const }] : []),
+    ...(env.ANTHROPIC_API_KEY ? [{ keyVar: 'ANTHROPIC_API_KEY', model: 'claude', source: 'anthropic-key' as const }] : []),
+  ];
+  if (available.length === 1) return { model: available[0]!.model, source: available[0]!.source };
+  if (available.length > 1) {
+    throw new Error(
+      `ambiguous: ${available.length} credentials found (${available.map((a) => a.keyVar).join(', ')}) and no model was ` +
+        'selected; pass --model, set COPPERHEAD_MODEL, or set "model" in .copperhead/config.json.',
+    );
+  }
   throw new Error(
-    'no model configured: pass --model codex (uses your local Codex login), set COPPERHEAD_MODEL, set model in .copperhead/config.json, or provide OPENAI_API_KEY/ANTHROPIC_API_KEY',
+    'no model configured: pass --model, set COPPERHEAD_MODEL, or export an API key; see https://docs.copperhead.sh/reference/configuration/',
   );
+}
+
+/** Where an OpenAI-compatible run points, and which variable holds its key. */
+export interface CompatSettings {
+  /** Endpoint base URL; undefined means the client's own default (OpenAI). */
+  baseURL?: string;
+  /** Name of the env var holding the key. Never the key itself. */
+  apiKeyEnv: string;
+}
+
+/** The credential variable used when nothing else is configured. */
+export const DEFAULT_API_KEY_ENV = 'OPENAI_API_KEY';
+
+/**
+ * Resolve the compatible-endpoint settings: environment wins over config, the
+ * same direction as `resolveModel`'s chain. These are *settings*, not a
+ * provider selector — only the `compat` route reads them (design D1/D2), so an
+ * exported COPPERHEAD_BASE_URL never silently redirects a `gpt-5` run.
+ */
+export function resolveCompatSettings(config: CopperheadConfig, env = process.env): CompatSettings {
+  const baseURL = env.COPPERHEAD_BASE_URL?.trim() || config.baseURL?.trim();
+  const apiKeyEnv = env.COPPERHEAD_API_KEY_ENV?.trim() || config.apiKeyEnv?.trim() || DEFAULT_API_KEY_ENV;
+  return { ...(baseURL ? { baseURL } : {}), apiKeyEnv };
+}
+
+/**
+ * True when a resolved model id routes through the `compat` provider (D1/D2).
+ * The single source of truth for that gate: `makeProvider` uses it to decide
+ * whether to consult `CompatSettings` at all, and the response cache (loop.ts)
+ * uses it to decide whether a run's cache key may depend on `baseURL` — a
+ * non-compat run (gpt-5, claude, ...) never reads COPPERHEAD_BASE_URL, so its
+ * cache key must not vary with it either, or every entry gets orphaned each
+ * time the endpoint used for unrelated compat testing changes.
+ */
+export function isCompatModel(model: string): boolean {
+  return model === 'compat' || model.startsWith('compat:');
+}
+
+/**
+ * True when the endpoint is loopback, i.e. a local server such as Ollama.
+ * Those need no credential (design D4); a remote endpoint always does.
+ */
+export function isLocalEndpoint(baseURL: string | undefined): boolean {
+  if (!baseURL) return false;
+  try {
+    const h = new URL(baseURL).hostname.toLowerCase();
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]' || h.endsWith('.local');
+  } catch {
+    return false; // an unparseable URL is not a local endpoint; the run fails later with a clearer error
+  }
 }
